@@ -1,6 +1,6 @@
 import json
 import redis.asyncio as aioredis
-from vkbottle import Keyboard, KeyboardButtonColor, Text, Callback, VKAPIError
+from vkbottle import Keyboard, KeyboardButtonColor, Text, VKAPIError
 from vkbottle.bot import Bot, Message, MessageEvent
 
 from config import BOT_TOKEN, INPUT_SURVEY_DATA, SCORE_MAP
@@ -46,7 +46,7 @@ async def queue_edit_message(user_id: int, message_id: int, click_data: dict):
         peer_id=user_id, message_id=message_id, message=text, keyboard=kb
     )
 
-@bot.on_message(text=["привет", "начать", "старт", "меню", "здравствуйте", "Начать тест", "Старт", "Начать"])
+@bot.on.message(text=["привет", "начать", "старт", "меню", "здравствуйте", "Начать тест", "Старт", "Начать"])
 async def send_welcome(message: Message):
     start_keyboard = Keyboard(one_time=False, inline=False)
     start_keyboard.add(Text("🚀 Начать тест"), color=KeyboardButtonColor.PRIMARY)
@@ -55,7 +55,7 @@ async def send_welcome(message: Message):
         keyboard=start_keyboard
     )
 
-@bot.on_message(text=["🚀 Начать тест", "/опрос"])
+@bot.on.message(text=["🚀 Начать тест", "/опрос"])
 async def start_survey(message: Message):
     peer_id = message.peer_id
     if peer_id in USER_SESSIONS:
@@ -68,11 +68,17 @@ async def start_survey(message: Message):
     intro_text = (
         "Перед вами список из 40 управленческих навыков. Пожалуйста, оцените свой собственный "
         "уровень владения каждым из этих навыков по шкале:\n"
-        "- Плохо\n"- "Скорее плохо\n"- "Скорее хорошо\n"- "Отлично"
+        "- Плохо\n"
+        "- Скорее плохо\n"
+        "- Скорее хорошо\n"
+        "- Отлично"
     )
     
     intro_msg = await bot.api.messages.send(
-        peer_id=peer_id, message=intro_text, keyboard=Keyboard(), random_id=0
+        peer_id=peer_id, 
+        message=intro_text, 
+        keyboard=Keyboard(), 
+        random_id=0,
     )
     intro_id = intro_msg if isinstance(intro_msg, int) else getattr(intro_msg, "message_id", None)
     if intro_id:
@@ -81,7 +87,7 @@ async def start_survey(message: Message):
     await send_current_survey_block(bot.api, peer_id, session)
 
 
-@bot.on_raw_event(event="message_event", dataclass=MessageEvent)
+@bot.on.raw_event(event="message_event", dataclass=MessageEvent)
 @idempotent_filter(redis_client, ttl=1.0)
 async def callback_controller(event: MessageEvent):
     peer_id = event.peer_id

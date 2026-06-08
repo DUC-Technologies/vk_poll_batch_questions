@@ -1,4 +1,5 @@
 import os
+from dotenv import load_dotenv
 
 OPTIONS = ["Отлично", "Скорее хорошо", "Скорее плохо", "Плохо"]
 
@@ -9,8 +10,9 @@ SCORE_MAP = {
     "Плохо": 0
 }
 
-DEFAULT_TOKEN = ""
-BOT_TOKEN = os.environ.get("VK_BOT_TOKEN", DEFAULT_TOKEN)
+load_dotenv()
+
+BOT_TOKEN = os.environ.get("VK_BOT_TOKEN")
 
 INPUT_SURVEY_DATA = [
     {
