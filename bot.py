@@ -14,7 +14,7 @@ redis_client = aioredis.from_url("redis://localhost:6379")
 bot = Bot(token=BOT_TOKEN)
 
 
-@redis_debounce_queue(redis_client, name="edit_keyboard", delay=0.3, max_wait=1.0)
+@redis_debounce_queue(redis_client, name="edit_keyboard", delay=1.3, max_wait=3.0)
 async def queue_edit_message(user_id: int, message_id: int, click_data: dict):
     """Вызывается воркером автоматически, когда истечет таймер debounce."""
     if user_id not in USER_SESSIONS:

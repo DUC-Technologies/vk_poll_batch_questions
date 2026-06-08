@@ -12,7 +12,10 @@
 import asyncio
 import time
 import json
+import logging
 from .queue import TASK_REGISTRY
+
+logger = logging.getLogger("infra.worker")
 
 LUA_COMPARE_AND_DELETE = """
 if redis.call('hget', KEYS[1], 'status') == 'processing' then
@@ -23,43 +26,38 @@ end
 """
 
 async def run_queue_worker(redis_client, name, rate_limiter):
-    """Асинхронный воркер очереди"""
+    """Асинхронный воркер очереди."""
     zset_key = f"queue:{name}"
     func = TASK_REGISTRY.get(name)
     
     while True:
         try:
             now = time.time()
+            # Берем одну созревшую задачу
             tasks = await redis_client.zrangebyscore(zset_key, 0, now, start=0, num=1)
             
             if not tasks:
-                # Разгружаем CPU (50 мс)
                 await asyncio.sleep(0.05)
                 continue
                 
-            task_id = tasks[0]
-            if isinstance(task_id, bytes):
-                task_id = task_id.decode()
-                
+            task_id = tasks[0].decode() if isinstance(tasks[0], bytes) else tasks[0]
             user_id, message_id = task_id.split(':')
             hash_key = f"edit_state:{user_id}:{message_id}"
             
-            # проверяем каскадный лимит ДО удаления задачи
+            # 1. Проверяем лимиты ДО удаления из очереди
             if not await rate_limiter.check_and_consume(user_id, "messages.edit"):
-                # лимит исчерпан, откладываем задачу на 0.5 сек. Очередь идет дальше
+                logger.info(f"⏳ [Worker] Каскадный лимит исчерпан. Отодвигаем {task_id} на +0.5с")
                 await redis_client.zadd(zset_key, {task_id: now + 0.5})
                 continue
                 
+            # 2. Атомарно удаляем из ZSET, чтобы другие воркеры (если их несколько) не подхватили
             if not await redis_client.zrem(zset_key, task_id):
                 continue
                 
-            # 1. ставим статус обработки
+            # Переводим в статус обработки
             await redis_client.hset(hash_key, "status", "processing")
             
             state = await redis_client.hgetall(hash_key)
-            if not state:
-                continue
-                
             p_val = state.get(b'payload') or state.get('payload')
             if not p_val:
                 continue
@@ -67,20 +65,24 @@ async def run_queue_worker(redis_client, name, rate_limiter):
             click_data = json.loads(p_val.decode() if isinstance(p_val, bytes) else p_val)
             
             try:
-                if not func:
-                    raise Exception(f"TASK_REGISTRY.get(name) сломалась с name = {name}")
+                logger.info(f"🚀 [Worker] Отправляем РЕЗУЛЬТАТ схлапывания в ВК для {task_id}...")
+                
+                # Выполняем messages.edit (передается самый ПОСЛЕДНИЙ сохраненный payload)
                 await func(int(user_id), int(message_id), click_data)
                 
-                # 2. безопасное удаление через Lua
-                await redis_client.eval(LUA_COMPARE_AND_DELETE, 1, hash_key)
+                # Проверяем через Lua: не было ли новых кликов, пока мы ждали ВК?
+                lua_result = await redis_client.eval(LUA_COMPARE_AND_DELETE, 1, hash_key)
+                
+                if lua_result == 0:
+                    logger.info(f"🔄 [Worker] [Lua]: Пока мы отправляли запрос, юзер кликнул снова! Стейт сохранен для следующего кадра.")
+                else:
+                    logger.info(f"✨ [Worker] Задача {task_id} успешно доставлена, стейт очищен.")
                 
             except Exception as e:
-                print(f"Ошибка при обработке запроса ВК: {e}")
-                # Откат
+                logger.error(f"💥 [Worker] Ошибка API ВК для {task_id}: {e}")
                 await redis_client.hdel(hash_key, "status")
                 await redis_client.zadd(zset_key, {task_id: time.time() + 0.5})
                 
         except Exception as ce:
-            print(f"Критический сбой цикла воркера: {ce}")
+            logger.critical(f"🚨 Критический сбой цикла воркера: {ce}")
             await asyncio.sleep(1)
-            

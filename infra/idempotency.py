@@ -1,6 +1,10 @@
 import json
+import logging
 from functools import wraps
 from vkbottle.bot import MessageEvent
+
+
+logger = logging.getLogger("infra.idempotency")
 
 def idempotent_filter(redis_client, ttl=1):
     """Отсекает дубликаты кликов по одной и той же кнопке в течение TTL."""
@@ -18,6 +22,10 @@ def idempotent_filter(redis_client, ttl=1):
             
             if not is_unique:
                 # клик повторный — убираем спиннер загрузки в вк
+                logger.info(
+                    f"🛑 [Idempotency] Отсечен дубликат клика! "
+                    f"Юзер: {user_id} | Msg ID: {message_id} | Payload: {event.payload}"
+                )
                 try:
                     await event.ctx_api.messages.send_message_event_answer(
                         event_id=event.event_id, user_id=event.user_id, peer_id=event.peer_id

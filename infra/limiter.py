@@ -1,4 +1,7 @@
 import time
+import logging
+
+logger = logging.getLogger("infra.limiter")
 
 class CascadeRateLimiter:
     """
@@ -12,9 +15,9 @@ class CascadeRateLimiter:
         now = time.time()
         
         buckets = [
-            {"key": "limiter:global", "max": 20, "rate": 20.0},                     # Глобальный ВК
-            {"key": f"limiter:method:{method}", "max": 5, "rate": 5.0},            # Лимит на messages.edit
-            {"key": f"limiter:user:{user_id}:{method}", "max": 2, "rate": 2.0},    # Лимит на юзера для edit
+            {"name": "Глобальный ВК", "key": "limiter:global", "max": 20, "rate": 20.0},
+            {"name": "Лимит Метода", "key": f"limiter:method:{method}", "max": 5, "rate": 5.0},
+            {"name": "Лимит Юзера", "key": f"limiter:user:{user_id}:{method}", "max": 2, "rate": 1.0},
         ]
         
         # Получаем данные по всем корзинам за один проход
@@ -24,6 +27,8 @@ class CascadeRateLimiter:
         results = await pipe.execute()
         
         updates = {}
+        bucket_status_logs = []
+        
         for idx, b in enumerate(buckets):
             data = results[idx]
             t_key = b'tokens' if b'tokens' in data else 'tokens'
@@ -38,9 +43,15 @@ class CascadeRateLimiter:
                 tokens = min(b["max"], float(data[t_key]) + passed_time * b["rate"])
             
             if tokens < 1:
+                logger.warning(
+                    f"❌ [RateLimiter] БЛОКИРОВКА! Нарушен '{b['name']}'. "
+                    f"Остаток токенов: {tokens:.2f} (требуется >= 1.0) | Юзер: {user_id}"
+                )
                 return False  # Дефицит токенов в каскаде
                 
-            updates[b["key"]] = {"tokens": str(tokens - 1), "last_refill": str(now)}
+            new_tokens = tokens - 1
+            updates[b["key"]] = {"tokens": str(new_tokens), "last_refill": str(now)}
+            bucket_status_logs.append(f"{b['name']}: {int(new_tokens)}/{b['max']}")
             
         # Если все проверки прошли, атомарно списываем токены
         pipe = self.redis.pipeline()
@@ -48,5 +59,6 @@ class CascadeRateLimiter:
             pipe.hset(key, mapping=mapping)
         await pipe.execute()
         
+        logger.info(f"📊 [RateLimiter] Токен списан успешно. Бакеты -> \n - {'\n - '.join(bucket_status_logs)}")
         return True
     
