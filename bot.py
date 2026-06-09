@@ -25,7 +25,7 @@ bot = Bot(token=BOT_TOKEN)
 async def queue_edit_message(user_id: int, message_id: int, click_data: dict):
     """
     Вызывается воркером автоматически, когда истечет таймер debounce.
-    Теперь запрашивает актуальный стейт сессии из Redis.
+    Запрашивает актуальный стейт сессии из Redis.
     """
     session = await get_user_session(redis_client, user_id)
     if not session:
@@ -84,11 +84,14 @@ async def start_survey(message: Message):
     
     intro_text = (
         "Перед вами список из 40 управленческих навыков. Пожалуйста, оцените свой собственный "
-        "уровень владения каждым из этих навыков по шкале:\n"
+        "уровень владения каждым из них по предложенной шкале:\n"
         "- Плохо\n"
         "- Скорее плохо\n"
         "- Скорее хорошо\n"
-        "- Отлично"
+        "- Отлично\n\n"
+        "💡 Обратите внимание: ввиду технических ограничений платформы ВКонтакте, "
+        "визуальный статус кнопки (изменение цвета на зелёный) может обновляться с задержкой или вовсе не обновляться. "
+        "Ваш выбор фиксируется системой мгновенно, как только исчезает анимация загрузки на кнопке."
     )
     
     intro_msg = await bot.api.messages.send(
@@ -97,19 +100,19 @@ async def start_survey(message: Message):
         keyboard=Keyboard(), 
         random_id=0,
     )
-    intro_id = intro_msg if isinstance(intro_msg, int) else getattr(intro_msg, "message_id", None)
-    if intro_id:
-        session.active_message_ids.append(int(intro_id))
+    # intro_id = intro_msg if isinstance(intro_msg, int) else getattr(intro_msg, "message_id", None)
+    # if intro_id:
+    #     session.active_message_ids.append(int(intro_id))
 
     # Отправляем первый блок вопросов юзеру
     await send_current_survey_block(bot.api, peer_id, session)
     
-    # Сохраняем итоговое состояние новой сессии (с ID отправленных сообщений) в Redis
+    # Сохраняем итоговое состояние новой сессии в Redis
     await save_user_session(redis_client, peer_id, session)
 
 
 @bot.on.raw_event(event="message_event", dataclass=MessageEvent)
-@idempotent_filter(redis_client, ttl=1.0)
+@idempotent_filter(redis_client, ttl=1)
 async def callback_controller(event: MessageEvent):
     peer_id = event.peer_id
     payload = event.payload
@@ -127,6 +130,17 @@ async def callback_controller(event: MessageEvent):
         except Exception:
             pass
         return
+
+    # Вспомогательная функция для вычисления порядковых номеров неотвеченных вопросов
+    def get_missing_question_numbers() -> str:
+        screen = session.current_screen
+        start_global_idx = sum(len(s.questions) for s in session.screens[:session.current_screen_idx]) + 1
+        
+        missing_numbers = []
+        for idx, q in enumerate(screen.questions):
+            if q.id not in session.results:
+                missing_numbers.append(str(start_global_idx + idx))
+        return ", ".join(missing_numbers)
 
     match action:
         case "select":
@@ -158,30 +172,38 @@ async def callback_controller(event: MessageEvent):
                 
         case "next":
             if not session.is_current_screen_complete():
+                unanswered_list = get_missing_question_numbers()
                 await event.ctx_api.messages.send_message_event_answer(
                     event_id=event.event_id, user_id=event.user_id, peer_id=event.peer_id,
-                    event_data=json.dumps({"type": "show_snackbar", "text": "⚠️ Оцените все навыки в текущем блоке!"})
+                    event_data=json.dumps({
+                        "type": "show_snackbar", 
+                        "text": f"⚠️ Заполните все ответы! Остались вопросы №: {unanswered_list}"
+                    })
                 )
                 return
             
             await delete_current_block_messages(event.ctx_api, session)
             if session.move_next():
                 await send_current_survey_block(event.ctx_api, peer_id, session)
-            # Сохраняем обновленный стейт (новый индекс экрана и новые ID сообщений)
+            # Сохраняем обновленный стейт
             await save_user_session(redis_client, peer_id, session)
                 
         case "prev":
             await delete_current_block_messages(event.ctx_api, session)
             if session.move_prev():
                 await send_current_survey_block(event.ctx_api, peer_id, session)
-            # Сохраняем обновленный стейт (вернулись назад)
+            # Сохраняем обновленный стейт
             await save_user_session(redis_client, peer_id, session)
                 
         case "submit":
             if not session.is_current_screen_complete():
+                unanswered_list = get_missing_question_numbers()
                 await event.ctx_api.messages.send_message_event_answer(
                     event_id=event.event_id, user_id=event.user_id, peer_id=event.peer_id,
-                    event_data=json.dumps({"type": "show_snackbar", "text": "⚠️ Пожалуйста, завершите оценку текущего блока."})
+                    event_data=json.dumps({
+                        "type": "show_snackbar", 
+                        "text": f"⚠️ Перед завершением ответьте на вопросы №: {unanswered_list}"
+                    })
                 )
                 return
 

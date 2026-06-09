@@ -1,8 +1,14 @@
 services:
   redis:
-    image: redis:7-alpine
-    container_name: redis-cache
-    command: redis-server --maxmemory 512mb --maxmemory-policy allkeys-lru --save "" --appendonly no
+    image: redis:7.2-alpine
+    container_name: vk_poll_redis
+    restart: always
     ports:
       - "6379:6379"
-    restart: unless-stopped
+    command: redis-server --appendonly yes --appendfsync everysec
+    volumes:
+      - redis_data:/data
+
+volumes:
+  redis_data:
+    driver: local
