@@ -1,5 +1,5 @@
 import asyncio
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 from vkbottle import VKAPIError
 from models import SurveyScreen, Question, UserSession
 from presenter import SurveyPresenter
@@ -73,3 +73,20 @@ async def delete_current_block_messages(api: Any, session: UserSession) -> None:
         except Exception:
             pass
         session.clear_message_tracking()
+
+async def get_user_session(redis_client, peer_id: int) -> Optional[UserSession]:
+    """Загружает стейт пользователя из Redis."""
+    data = await redis_client.get(f"session:{peer_id}")
+    if not data:
+        return None
+    return UserSession.from_json(data.decode() if isinstance(data, bytes) else data)
+
+
+async def save_user_session(redis_client, peer_id: int, session: UserSession) -> None:
+    """Сохраняет стейт пользователя в Redis (с TTL 1 сутки, чтобы не забивать базу заброшенными тестами)."""
+    await redis_client.set(f"session:{peer_id}", session.to_json(), ex=86400)
+
+
+async def delete_user_session(redis_client, peer_id: int) -> None:
+    """Удаляет стейт из Redis по окончании теста."""
+    await redis_client.delete(f"session:{peer_id}")

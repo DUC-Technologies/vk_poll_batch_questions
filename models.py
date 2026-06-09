@@ -1,4 +1,5 @@
 from dataclasses import dataclass, field
+import json
 from typing import List, Dict
 
 @dataclass(frozen=True)
@@ -48,6 +49,43 @@ class UserSession:
     def clear_message_tracking(self) -> None:
         self.active_message_ids.clear()
         self.q_to_msg_map.clear()
+        
+    def to_json(self) -> str:
+        """Превращает сессию в JSON-строку для хранения в Redis."""
+        # Сами экраны (screens) статичны и берутся из конфига, 
+        # но для автономности структуры сохраняем всё дерево.
+        data = {
+            "current_screen_idx": self.current_screen_idx,
+            "results": self.results,
+            "active_message_ids": self.active_message_ids,
+            "q_to_msg_map": self.q_to_msg_map,
+            "screens": [
+                {
+                    "block_name": s.block_name,
+                    "questions": [{"id": q.id, "question": q.question, "options": q.options} for q in s.questions]
+                }
+                for s in self.screens
+            ]
+        }
+        return json.dumps(data, ensure_ascii=False)
 
-
-USER_SESSIONS: Dict[int, UserSession] = {}
+    @classmethod
+    def from_json(cls, json_str: str) -> "UserSession":
+        """Восстанавливает объект UserSession из JSON-строки, полученной из Redis."""
+        data = json.loads(json_str)
+        
+        screens = [
+            SurveyScreen(
+                block_name=s["block_name"],
+                questions=[Question(**q) for q in s["questions"]]
+            )
+            for s in data["screens"]
+        ]
+        
+        return cls(
+            screens=screens,
+            current_screen_idx=data["current_screen_idx"],
+            results=data["results"],
+            active_message_ids=data["active_message_ids"],
+            q_to_msg_map={k: int(v) for k, v in data["q_to_msg_map"].items()}
+        )

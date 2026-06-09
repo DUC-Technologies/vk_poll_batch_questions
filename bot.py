@@ -4,23 +4,33 @@ from vkbottle import Keyboard, KeyboardButtonColor, Text, VKAPIError
 from vkbottle.bot import Bot, Message, MessageEvent
 
 from config import BOT_TOKEN, INPUT_SURVEY_DATA, SCORE_MAP
-from models import USER_SESSIONS, UserSession
+from models import UserSession
 from presenter import SurveyPresenter
-from services import parse_survey_data, send_current_survey_block, delete_current_block_messages
 from infra import idempotent_filter, redis_debounce_queue
+from services import (
+    parse_survey_data, 
+    send_current_survey_block, 
+    delete_current_block_messages,
+    get_user_session,
+    save_user_session,
+    delete_user_session
+)
 
-
+# Инициализация клиента Redis и Бота
 redis_client = aioredis.from_url("redis://localhost:6379")
 bot = Bot(token=BOT_TOKEN)
 
 
 @redis_debounce_queue(redis_client, name="edit_keyboard", delay=1.3, max_wait=3.0)
 async def queue_edit_message(user_id: int, message_id: int, click_data: dict):
-    """Вызывается воркером автоматически, когда истечет таймер debounce."""
-    if user_id not in USER_SESSIONS:
+    """
+    Вызывается воркером автоматически, когда истечет таймер debounce.
+    Теперь запрашивает актуальный стейт сессии из Redis.
+    """
+    session = await get_user_session(redis_client, user_id)
+    if not session:
         return
         
-    session = USER_SESSIONS[user_id]
     q_id = click_data["q_id"]
     opt_idx = click_data["opt_idx"]
     
@@ -42,9 +52,13 @@ async def queue_edit_message(user_id: int, message_id: int, click_data: dict):
         global_idx=start_global_idx + q_idx
     )
     
-    await bot.api.messages.edit(
-        peer_id=user_id, message_id=message_id, message=text, keyboard=kb
-    )
+    try:
+        await bot.api.messages.edit(
+            peer_id=user_id, message_id=message_id, message=text, keyboard=kb
+        )
+    except Exception:
+        pass
+
 
 @bot.on.message(text=["привет", "начать", "старт", "меню", "здравствуйте", "Начать тест", "Старт", "Начать"])
 async def send_welcome(message: Message):
@@ -55,15 +69,18 @@ async def send_welcome(message: Message):
         keyboard=start_keyboard
     )
 
+
 @bot.on.message(text=["🚀 Начать тест", "/опрос"])
 async def start_survey(message: Message):
     peer_id = message.peer_id
-    if peer_id in USER_SESSIONS:
-        await delete_current_block_messages(bot.api, USER_SESSIONS[peer_id])
+    
+    # Проверяем, была ли у пользователя активная сессия в Redis, и зачищаем старые сообщения
+    old_session = await get_user_session(redis_client, peer_id)
+    if old_session:
+        await delete_current_block_messages(bot.api, old_session)
         
     screens = parse_survey_data(INPUT_SURVEY_DATA)
     session = UserSession(screens=screens)
-    USER_SESSIONS[peer_id] = session
     
     intro_text = (
         "Перед вами список из 40 управленческих навыков. Пожалуйста, оцените свой собственный "
@@ -84,7 +101,11 @@ async def start_survey(message: Message):
     if intro_id:
         session.active_message_ids.append(int(intro_id))
 
+    # Отправляем первый блок вопросов юзеру
     await send_current_survey_block(bot.api, peer_id, session)
+    
+    # Сохраняем итоговое состояние новой сессии (с ID отправленных сообщений) в Redis
+    await save_user_session(redis_client, peer_id, session)
 
 
 @bot.on.raw_event(event="message_event", dataclass=MessageEvent)
@@ -94,7 +115,10 @@ async def callback_controller(event: MessageEvent):
     payload = event.payload
     action = payload.get("act")
     
-    if peer_id not in USER_SESSIONS:
+    # Пытаемся получить сессию из Redis
+    session = await get_user_session(redis_client, peer_id)
+    
+    if not session:
         try:
             await event.ctx_api.messages.send_message_event_answer(
                 event_id=event.event_id, user_id=event.user_id, peer_id=event.peer_id,
@@ -103,8 +127,6 @@ async def callback_controller(event: MessageEvent):
         except Exception:
             pass
         return
-
-    session = USER_SESSIONS[peer_id]
 
     match action:
         case "select":
@@ -124,12 +146,14 @@ async def callback_controller(event: MessageEvent):
                     pass
                 return
                 
-            # обновляем состояние сессии для корректных проверок "Next"
+            # Обновляем состояние результатов в объекте сессии
             session.results[q_id] = opt_idx
+            # Сразу же сохраняем измененные ответы в Redis стейт
+            await save_user_session(redis_client, peer_id, session)
             
             msg_id = session.q_to_msg_map.get(q_id)
             if msg_id:
-                # пушим задачу в очередь
+                # Отправляем задачу в инфраструктурную очередь дебаунса
                 await queue_edit_message(peer_id, msg_id, {"q_id": q_id, "opt_idx": opt_idx})
                 
         case "next":
@@ -143,11 +167,15 @@ async def callback_controller(event: MessageEvent):
             await delete_current_block_messages(event.ctx_api, session)
             if session.move_next():
                 await send_current_survey_block(event.ctx_api, peer_id, session)
+            # Сохраняем обновленный стейт (новый индекс экрана и новые ID сообщений)
+            await save_user_session(redis_client, peer_id, session)
                 
         case "prev":
             await delete_current_block_messages(event.ctx_api, session)
             if session.move_prev():
                 await send_current_survey_block(event.ctx_api, peer_id, session)
+            # Сохраняем обновленный стейт (вернулись назад)
+            await save_user_session(redis_client, peer_id, session)
                 
         case "submit":
             if not session.is_current_screen_complete():
@@ -175,9 +203,11 @@ async def callback_controller(event: MessageEvent):
                 peer_id=peer_id, message="\n".join(result_lines), keyboard=Keyboard(), random_id=0
             )
             print(json.dumps(final_results, ensure_ascii=False, indent=4))
-            del USER_SESSIONS[peer_id]
+            
+            # Тест завершен — полностью удаляем сессию из Redis базы
+            await delete_user_session(redis_client, peer_id)
         
-    # убираем анимацию колесика на кнопке для UX
+    # Убираем анимацию загрузки (колесико) на кнопке VK
     try:
         await event.ctx_api.messages.send_message_event_answer(
             event_id=event.event_id, user_id=event.user_id, peer_id=event.peer_id
@@ -185,10 +215,11 @@ async def callback_controller(event: MessageEvent):
     except Exception:
         pass
 
+
 @bot.error_handler.register_error_handler(VKAPIError)
 async def handle_vk_flood_error(e: VKAPIError):
     if e.code == 9:
-        print("⚠️ [Системный перехват] VK API Error 9: Зафиксирован Flood Control.")
+        print("⚠️ [Системный перехват] VK API Error 9: Зафиксирован Flood Control. Активирована каскадная защита.")
     else:
         raise e
     
